@@ -2,13 +2,15 @@ import AppKit
 import Combine
 import Foundation
 
+/// One UI row = one application (bundle ID). Helper processes sharing a
+/// bundle merge into a single row; the engine taps the whole bundle.
 struct AppRowModel: Identifiable {
-    let id: pid_t
-    let pid: pid_t
+    var id: String { key }
+    let key: String
     let bundleID: String?
-    let name: String
-    let icon: NSImage?
-    var volume: Float      // 0...1.5
+    var name: String
+    var icon: NSImage?
+    var volume: Float      // 0...1
     var muted: Bool
     var level: Float       // 0...1 meter
     var isComm: Bool
@@ -30,7 +32,6 @@ final class AudioState: ObservableObject {
     private let detector = ProcessDetector()
     private let engine = TapEngine.shared
     private var meterTimer: Timer?
-    private var lastAudible: [AudibleApp] = []
 
     init() {
         let (mg, mm) = engine.getMaster()
@@ -66,35 +67,49 @@ final class AudioState: ObservableObject {
     }
 
     private func handleAudible(_ audible: [AudibleApp]) {
-        lastAudible = audible
         engine.setAudibleApps(audible)
         engine.noteMutated()
-        // Preserve existing slider values; add new apps with persisted values.
-        var byPid: [pid_t: AppRowModel] = Dictionary(uniqueKeysWithValues: apps.map { ($0.pid, $0) })
-        var next: [AppRowModel] = []
+        // Group helper PIDs by app key; preserve existing slider values.
+        var grouped: [String: [AudibleApp]] = [:]
         for a in audible {
-            if let existing = byPid[a.pid] {
+            grouped[engine.keyFor(bundleID: a.bundleID, pid: a.pid), default: []].append(a)
+        }
+        var byKey: [String: AppRowModel] = Dictionary(uniqueKeysWithValues: apps.map { ($0.key, $0) })
+        var next: [AppRowModel] = []
+        for (key, group) in grouped {
+            // Prefer the main app process for name/icon over helpers.
+            let rep = group.sorted { score($0) > score($1) }.first!
+            if var existing = byKey[key] {
+                existing.name = rep.name
+                existing.icon = rep.icon ?? existing.icon
                 next.append(existing)
             } else {
-                let vol = engine.userGain(bundleID: a.bundleID, pid: a.pid)
-                let mute = engine.isMuted(bundleID: a.bundleID, pid: a.pid)
                 next.append(AppRowModel(
-                    id: a.pid, pid: a.pid, bundleID: a.bundleID,
-                    name: a.name, icon: a.icon,
-                    volume: vol, muted: mute, level: 0,
-                    isComm: isComm(a.bundleID)
+                    key: key, bundleID: rep.bundleID,
+                    name: rep.name, icon: rep.icon,
+                    volume: engine.userGain(key: key),
+                    muted: engine.isMuted(key: key),
+                    level: 0, isComm: isComm(rep.bundleID)
                 ))
             }
-            byPid.removeValue(forKey: a.pid)
+            byKey.removeValue(forKey: key)
         }
         apps = next.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         refreshOutputs()
     }
 
+    /// Rank processes for display: real app bundle + running app first.
+    private func score(_ a: AudibleApp) -> Int {
+        var s = 0
+        if a.bundleID != nil { s += 2 }
+        if NSRunningApplication(processIdentifier: a.pid) != nil { s += 1 }
+        return s
+    }
+
     private func refreshMeters() {
         guard !apps.isEmpty else { return }
         for i in apps.indices {
-            apps[i].level = engine.peak(for: apps[i].pid)
+            apps[i].level = engine.peak(key: apps[i].key)
         }
     }
 
@@ -102,21 +117,21 @@ final class AudioState: ObservableObject {
         outputs = engine.outputDevices()
     }
 
-    func setVolume(pid: pid_t, value: Float) {
-        guard let idx = apps.firstIndex(where: { $0.pid == pid }) else { return }
+    func setVolume(key: String, value: Float) {
+        guard let idx = apps.firstIndex(where: { $0.key == key }) else { return }
         apps[idx].volume = value
         // Touching the slider unmutes (standard mixer behavior).
         if apps[idx].muted {
             apps[idx].muted = false
-            engine.setUserMuted(bundleID: apps[idx].bundleID, pid: pid, muted: false)
+            engine.setUserMuted(key: key, muted: false)
         }
-        engine.setUserGain(bundleID: apps[idx].bundleID, pid: pid, value: value)
+        engine.setUserGain(key: key, bundleID: apps[idx].bundleID, value: value)
     }
 
-    func setMuted(pid: pid_t, muted: Bool) {
-        guard let idx = apps.firstIndex(where: { $0.pid == pid }) else { return }
+    func setMuted(key: String, muted: Bool) {
+        guard let idx = apps.firstIndex(where: { $0.key == key }) else { return }
         apps[idx].muted = muted
-        engine.setUserMuted(bundleID: apps[idx].bundleID, pid: pid, muted: muted)
+        engine.setUserMuted(key: key, muted: muted)
     }
 
     func setMasterVolume(_ v: Float) {

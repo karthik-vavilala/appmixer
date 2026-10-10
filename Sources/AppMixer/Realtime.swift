@@ -90,25 +90,25 @@ final class StereoRing: @unchecked Sendable {
 
 /// One tapped app: tap + tap-only aggregate + tap IOProc + ring + gain/peak state.
 final class TapSlot: @unchecked Sendable {
-    let pid: pid_t
+    let key: String
     let bundleID: String?
-    let processObjectID: AudioObjectID
+    var displayName: String
     var tapID: AudioObjectID = kAudioObjectUnknown
     var aggregateID: AudioObjectID = kAudioObjectUnknown
     var ioProc: AudioDeviceIOProcID?
     var tapUID: String = ""
 
     private var stateLock = os_unfair_lock()
-    private var _gain: Float = 1.0       // user gain 0...1.5 (effective incl. duck/master applied by engine)
+    private var _gain: Float = 1.0       // effective gain incl. duck/master, 0...1
     private var _muted: Bool = false
     private var _peak: Float = 0
 
     let ring = StereoRing()
 
-    init(pid: pid_t, bundleID: String?, processObjectID: AudioObjectID) {
-        self.pid = pid
+    init(key: String, bundleID: String?, displayName: String) {
+        self.key = key
         self.bundleID = bundleID
-        self.processObjectID = processObjectID
+        self.displayName = displayName
     }
 
     nonisolated func setGain(_ g: Float) {

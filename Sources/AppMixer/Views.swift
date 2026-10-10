@@ -191,8 +191,8 @@ struct MixerPanelView: View {
                     ForEach(state.apps) { app in
                         AppRowView(
                             app: app,
-                            onVolume: { state.setVolume(pid: app.pid, value: $0) },
-                            onMute: { state.setMuted(pid: app.pid, muted: $0) }
+                            onVolume: { state.setVolume(key: app.key, value: $0) },
+                            onMute: { state.setMuted(key: app.key, muted: $0) }
                         )
                         Divider().opacity(0.4)
                     }

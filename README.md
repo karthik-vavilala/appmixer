@@ -14,9 +14,11 @@ Built on Apple's Core Audio Process Tap API (`CATapDescription`,
 
 1. `ProcessDetector` polls `kAudioHardwarePropertyProcessObjectList` +
    `kAudioProcessPropertyIsRunningOutput` (1 Hz + HAL listener).
-2. `TapEngine` creates one `CATapMutedWhenTapped` tap per audible app.
-   Tapped audio is silenced on its direct path and re-played by us —
-   quit/crash/stall and macOS un-mutes the app (crash-safe).
+2. `TapEngine` creates one persistent tap per application (bundle ID,
+   auto-restored across helper respawns on macOS 26+; PID taps with a 30 s
+   grace period elsewhere). The graph is built once per app, so the system
+   permission prompt appears once per app — never again for new
+   songs, ads, or pause/resume gaps.
 3. Each tap lives in its own private tap-only aggregate (drift compensation on,
    no output subdevice — Bluetooth HFP safe).
 4. A tap IOProc applies nothing but pushes raw stereo into a per-app ring

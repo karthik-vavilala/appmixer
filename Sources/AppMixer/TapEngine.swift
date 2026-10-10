@@ -2,17 +2,29 @@ import CoreAudio
 import Foundation
 
 /// Core engine: per-app process taps -> tap-only aggregates -> rings -> output mixer.
-/// - One CATapMutedWhenTapped tap per audible app silences its direct path while we read it.
-///   If we quit/crash/stall, macOS un-mutes the app so audio keeps playing (crash-safe).
-/// - Each tap lives in its own private tap-only aggregate (no output subdevice).
-/// - A single output IOProc on the real default output device mixes rings additively:
-///   outputData (system mix of untapped apps) is preserved, tapped audio is added back
-///   with per-app gain. Non-tapped apps flow through unchanged.
+///
+/// Tapping strategy (this is what keeps the permission prompt to once per app):
+/// - On macOS 26+: ONE tap per bundle ID (`CATapDescription.bundleIDs` +
+///   `processRestoreEnabled`). The tap survives helper-process respawns,
+///   track/ad changes and pause gaps — the audio graph is built once and
+///   never rebuilt, so macOS never re-prompts for the same app.
+/// - Older macOS / processes without a bundle ID: PID taps with a 30 s
+///   destroy grace period, so brief silence gaps don't tear the graph down.
+///
+/// Other notes:
+/// - Taps use CATapMutedWhenTapped: tapped audio is silenced on its direct
+///   path while we read it. If we quit/crash/stall, macOS un-mutes the app.
+/// - Each tap lives in its own private tap-only aggregate (no output
+///   subdevice — Bluetooth HFP safe) with drift compensation on.
+/// - One output IOProc on the real default output device mixes rings
+///   additively into outputData. Untapped apps flow through untouched.
 final class TapEngine {
     static let shared = TapEngine()
 
     private let queue = DispatchQueue(label: "com.karthikvavilala.appmixer.engine")
-    private var slots: [pid_t: TapSlot] = [:]
+    private var slots: [String: TapSlot] = [:]   // key = "bid:..." or "pid:..."
+    private var lastSeen: [String: Date] = [:]
+    private var reapTimer: DispatchSourceTimer?
     private var outputDevice: AudioObjectID = kAudioObjectUnknown
     private var outputIOProc: AudioDeviceIOProcID?
     private var outputRunning = false
@@ -26,7 +38,7 @@ final class TapEngine {
     private var masterMuted: Bool = false
     private var duckAmount: Float = 0.5
     private var duckEnabled: Bool = true
-    private var currentBundleByPID: [pid_t: String?] = [:]
+    private var currentBundles: Set<String> = []
 
     private var snapshot: [TapSlot] = []
     private let snapshotLock = NSLock()
@@ -37,17 +49,23 @@ final class TapEngine {
         "facetime", "skype", "meet.google", "chime"
     ]
 
+    /// Seconds a PID-tapped (non-bundle) slot survives silence before teardown.
+    private let pidGracePeriod: TimeInterval = 30
+
     private init() {
         loadPersisted()
         queue.async { [weak self] in
             self?.refreshOutputDevice()
             self?.installDeviceChangeListener()
+            self?.startReaper()
         }
     }
 
-    // MARK: - persistence
+    // MARK: - keys & persistence
 
-    private func keyFor(bundleID: String?, pid: pid_t) -> String {
+    /// Stable per-app key. Bundle-based when possible so respawned helpers
+    /// and track changes map to the same slot (and the same saved volume).
+    func keyFor(bundleID: String?, pid: pid_t) -> String {
         if let b = bundleID { return "bid:\(b)" }
         return "pid:\(pid)"
     }
@@ -68,34 +86,30 @@ final class TapEngine {
         d.set(duckAmount, forKey: "appmixer.duck")
     }
 
-    // MARK: - public state API
+    // MARK: - public state API (keys, not pids)
 
-    func userGain(bundleID: String?, pid: pid_t) -> Float {
-        let k = keyFor(bundleID: bundleID, pid: pid)
-        return queue.sync { userGains[k] ?? 1.0 }
+    func userGain(key: String) -> Float {
+        queue.sync { userGains[key] ?? 1.0 }
     }
 
-    func isMuted(bundleID: String?, pid: pid_t) -> Bool {
-        let k = keyFor(bundleID: bundleID, pid: pid)
-        return queue.sync { userMutes[k] ?? false }
+    func isMuted(key: String) -> Bool {
+        queue.sync { userMutes[key] ?? false }
     }
 
-    func setUserGain(bundleID: String?, pid: pid_t, value: Float) {
-        let k = keyFor(bundleID: bundleID, pid: pid)
+    func setUserGain(key: String, bundleID: String?, value: Float) {
         queue.async { [weak self] in
             guard let self else { return }
-            self.userGains[k] = max(0, min(1.0, value))
+            self.userGains[key] = max(0, min(1.0, value))
             self.save()
             self.applyEffectiveGains()
             self.mirrorAppleScript(bundleID: bundleID, gain: value)
         }
     }
 
-    func setUserMuted(bundleID: String?, pid: pid_t, muted: Bool) {
-        let k = keyFor(bundleID: bundleID, pid: pid)
+    func setUserMuted(key: String, muted: Bool) {
         queue.async { [weak self] in
             guard let self else { return }
-            self.userMutes[k] = muted
+            self.userMutes[key] = muted
             self.save()
             self.applyEffectiveGains()
         }
@@ -129,8 +143,8 @@ final class TapEngine {
         }
     }
 
-    func peak(for pid: pid_t) -> Float {
-        queue.sync { slots[pid]?.readPeak() ?? 0 }
+    func peak(key: String) -> Float {
+        queue.sync { slots[key]?.readPeak() ?? 0 }
     }
 
     func noteMutated() {
@@ -142,19 +156,44 @@ final class TapEngine {
     func setAudibleApps(_ apps: [AudibleApp]) {
         queue.async { [weak self] in
             guard let self else { return }
-            let newPIDs = Set(apps.map { $0.pid })
-            self.currentBundleByPID = Dictionary(uniqueKeysWithValues: apps.map { ($0.pid, $0.bundleID) })
-
-            let toRemove = Set(self.slots.keys).subtracting(newPIDs)
-            for pid in toRemove { self.destroySlot(pid: pid) }
-
-            for app in apps where self.slots[app.pid] == nil {
-                self.createSlot(app: app)
+            // Group by app key: helpers sharing a bundle ID merge into one slot/row.
+            var byKey: [String: [AudibleApp]] = [:]
+            for a in apps {
+                byKey[self.keyFor(bundleID: a.bundleID, pid: a.pid), default: []].append(a)
             }
+            let now = Date()
+            for key in byKey.keys { self.lastSeen[key] = now }
+            self.currentBundles = Set(byKey.values.compactMap { $0.first?.bundleID })
+
+            for (key, group) in byKey where self.slots[key] == nil {
+                self.createSlot(key: key, apps: group)
+            }
+            // NOTE: no immediate destroy here. PID slots are reaped after a
+            // grace period (pause/gap safe); bundle slots persist all session.
             self.applyEffectiveGains()
             self.publishSnapshot()
             self.ensureOutputRunning()
         }
+    }
+
+    private func startReaper() {
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now() + 5, repeating: 5)
+        t.setEventHandler { [weak self] in self?.reapStaleSlots() }
+        t.resume()
+        reapTimer = t
+    }
+
+    private func reapStaleSlots() {
+        let cutoff = Date().addingTimeInterval(-pidGracePeriod)
+        for (key, seen) in lastSeen where seen < cutoff {
+            // Bundle taps persist for the whole session (that's the point:
+            // quit/relaunch of helpers must not rebuild the graph).
+            guard key.hasPrefix("pid:") else { continue }
+            destroySlot(key: key)
+            lastSeen.removeValue(forKey: key)
+        }
+        publishSnapshot()
     }
 
     // MARK: - effective gains + ducking
@@ -166,7 +205,7 @@ final class TapEngine {
 
     private func commActive() -> Bool {
         guard duckEnabled else { return false }
-        for case let (_, bid?) in currentBundleByPID where isCommBundle(bid) {
+        for bid in currentBundles where isCommBundle(bid) {
             return true
         }
         return false
@@ -174,14 +213,12 @@ final class TapEngine {
 
     private func applyEffectiveGains() {
         let ducking = commActive()
-        for (pid, slot) in slots {
-            let realBundle: String? = currentBundleByPID[pid] ?? nil
-            let lookupKey = keyFor(bundleID: realBundle, pid: pid)
-            let user = userGains[lookupKey] ?? 1.0
-            let muted = userMutes[lookupKey] ?? false
+        for (key, slot) in slots {
+            let user = userGains[key] ?? 1.0
+            let muted = userMutes[key] ?? false
             var eff = user * masterGain
             if masterMuted { eff = 0 }
-            if ducking, let rb = realBundle, !isCommBundle(rb) {
+            if ducking, let rb = slot.bundleID, !isCommBundle(rb) {
                 eff *= (1.0 - duckAmount)
             }
             slot.setGain(eff)
@@ -191,14 +228,51 @@ final class TapEngine {
 
     // MARK: - tap + aggregate lifecycle
 
-    private func createSlot(app: AudibleApp) {
+    private func createSlot(key: String, apps: [AudibleApp]) {
         guard #available(macOS 14.2, *) else {
             DispatchQueue.main.async { [weak self] in self?.onError?("Per-app taps require macOS 14.2+.") }
             return
         }
-        guard let processObject = translatePIDToProcessObject(app.pid) else { return }
+        guard let rep = apps.first else { return }
+
+        // Preferred: persistent bundle-ID tap (macOS 26+). One tap per app,
+        // auto-restored across helper respawns — no graph rebuilds, no re-prompts.
+        if let bid = rep.bundleID, #available(macOS 26, *) {
+            let desc = CATapDescription()
+            desc.name = "AppMixer: \(rep.name)"
+            desc.isPrivate = true
+            desc.isExclusive = false
+            desc.isMixdown = true
+            desc.isMono = false
+            desc.muteBehavior = .mutedWhenTapped
+            desc.bundleIDs = [bid]
+            desc.isProcessRestoreEnabled = true
+            var tapID = AudioObjectID(kAudioObjectUnknown)
+            let st = AudioHardwareCreateProcessTap(desc, &tapID)
+            if st == noErr, let uid = tapUID(tapID) {
+                let slot = TapSlot(key: key, bundleID: bid, displayName: rep.name)
+                slot.tapID = tapID
+                slot.tapUID = uid
+                slots[key] = slot
+                do {
+                    try createAggregateAndStartTap(slot: slot)
+                } catch {
+                    destroySlot(key: key)
+                    DispatchQueue.main.async { [weak self] in self?.onError?("Audio setup failed for \(rep.name)") }
+                }
+                return
+            }
+            if st == Int32(kAudioHardwareIllegalOperationError) || st == Int32(kAudioHardwareBadObjectError) {
+                DispatchQueue.main.async { [weak self] in self?.onPermissionNeeded?() }
+                return
+            }
+            // Other failures: fall through to PID tap.
+        }
+
+        // Fallback: tap the concrete process.
+        guard let processObject = translatePIDToProcessObject(rep.pid) else { return }
         let desc = CATapDescription(stereoMixdownOfProcesses: [processObject])
-        desc.name = "AppMixer: \(app.name)"
+        desc.name = "AppMixer: \(rep.name)"
         desc.isPrivate = true
         desc.isExclusive = false
         desc.isMixdown = true
@@ -211,7 +285,7 @@ final class TapEngine {
             if st == Int32(kAudioHardwareIllegalOperationError) || st == Int32(kAudioHardwareBadObjectError) {
                 DispatchQueue.main.async { [weak self] in self?.onPermissionNeeded?() }
             } else {
-                let msg = "Tap failed for \(app.name) (\(st))"
+                let msg = "Tap failed for \(rep.name) (\(st))"
                 DispatchQueue.main.async { [weak self] in self?.onError?(msg) }
             }
             return
@@ -222,23 +296,28 @@ final class TapEngine {
             }
             return
         }
-        let slot = TapSlot(pid: app.pid, bundleID: app.bundleID, processObjectID: processObject)
+        let slot = TapSlot(key: key, bundleID: rep.bundleID, displayName: rep.name)
         slot.tapID = tapID
         slot.tapUID = uid
-        slots[app.pid] = slot
+        slots[key] = slot
 
         do {
             try createAggregateAndStartTap(slot: slot)
         } catch {
-            destroySlot(pid: app.pid)
-            DispatchQueue.main.async { [weak self] in self?.onError?("Audio setup failed for \(app.name)") }
+            destroySlot(key: key)
+            DispatchQueue.main.async { [weak self] in self?.onError?("Audio setup failed for \(rep.name)") }
         }
     }
 
+    private func sanitized(_ key: String) -> String {
+        key.replacingOccurrences(of: ":", with: "-")
+            .replacingOccurrences(of: " ", with: "_")
+    }
+
     private func createAggregateAndStartTap(slot: TapSlot) throws {
-        let aggUID = "com.karthikvavilala.appmixer.tap.\(slot.pid).\(UUID().uuidString)"
+        let aggUID = "com.karthikvavilala.appmixer.tap.\(sanitized(slot.key)).\(UUID().uuidString)"
         let desc: [String: Any] = [
-            kAudioAggregateDeviceNameKey: "AppMixer Tap \(slot.pid)",
+            kAudioAggregateDeviceNameKey: "AppMixer Tap \(slot.displayName)",
             kAudioAggregateDeviceUIDKey: aggUID,
             kAudioAggregateDeviceIsPrivateKey: 1,
             kAudioAggregateDeviceIsStackedKey: 0,
@@ -262,7 +341,6 @@ final class TapEngine {
             guard let slot else { return }
             let (gain, muted) = slot.loadGain()
             let effGain: Float = muted ? 0 : gain
-            // Read input taps via buffer-list pointer (no allocation on realtime thread).
             let abl = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inData))
             var peak: Float = 0
             if abl.count >= 2 {
@@ -314,8 +392,8 @@ final class TapEngine {
         return st == noErr && alive != 0
     }
 
-    private func destroySlot(pid: pid_t) {
-        guard let slot = slots.removeValue(forKey: pid) else { return }
+    private func destroySlot(key: String) {
+        guard let slot = slots.removeValue(forKey: key) else { return }
         if let proc = slot.ioProc, slot.aggregateID != kAudioObjectUnknown {
             AudioDeviceStop(slot.aggregateID, proc)
             AudioDeviceDestroyIOProcID(slot.aggregateID, proc)
@@ -388,11 +466,7 @@ final class TapEngine {
                     if gain == 0 { continue }
                     _ = slot.ring.popAndMix(outLeft: d0, outRight: d1, frames: frames, gain: gain)
                 }
-                _ = b1
             } else if outABL.count == 1 {
-                // Interleaved output: pop per-slot in chunks to avoid heap allocation.
-                // Uses small stack scratch via static thread-local? v1 uses chunked heap arrays
-                // only on underrun-free paths; acceptable but noted for future lock-free work.
                 let b0 = outABL[0]
                 guard let d = b0.mData?.assumingMemoryBound(to: Float.self) else { return }
                 let channels = max(Int(b0.mNumberChannels), 1)
