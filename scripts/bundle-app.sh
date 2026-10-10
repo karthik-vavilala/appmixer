@@ -2,7 +2,7 @@
 # Build AppMixer.app bundle from SwiftPM executable (no full Xcode required).
 set -e
 cd "$(dirname "$0")/.."
-swift build -c release
+swift build -c release --arch arm64 --arch x86_64
 APP="dist/AppMixer.app"
 rm -rf dist
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"

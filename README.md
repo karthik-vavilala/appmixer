@@ -5,7 +5,7 @@ master volume, output picker, auto-ducking on calls, persisted levels.
 Built on Apple's Core Audio Process Tap API (`CATapDescription`,
 `AudioHardwareCreateProcessTap`) — no kernel extensions, no virtual drivers.
 
-- Requires macOS 14.2+ (tested on macOS 26/27, Apple Silicon).
+- Requires macOS 14.2+ (tested on macOS 26/27; universal binary: Apple Silicon + Intel).
 - Non-sandboxed (process taps are unavailable to sandboxed apps).
 - First launch prompts for **Screen & System Audio Recording** (`NSAudioCaptureUsageDescription`).
   Audio is mixed locally; nothing is recorded or sent anywhere.
